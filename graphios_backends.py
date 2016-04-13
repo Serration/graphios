@@ -10,6 +10,7 @@ import base64
 import urllib2
 import json
 import os
+import ast
 # ###########################################################
 # #### Librato Backend
 
@@ -50,7 +51,7 @@ class librato(object):
         try:
             cfg['librato_namevals']
         except:
-            self.namevals = ['GRAPHITEPREFIX', 'SERVICEDESC',
+            self.namevals = ['METRICBASEPATH', 'GRAPHITEPREFIX', 'SERVICEDESC',
                              'GRAPHITEPOSTFIX', 'LABEL']
         else:
             self.namevals = cfg['librato_namevals'].split(",")
@@ -86,6 +87,7 @@ class librato(object):
         path = re.sub(r"^\.", '', path)  # fix sources that begin in dot
         path = re.sub(r"\.$", '', path)  # fix sources that end in dot
         path = re.sub(r"\.\.", '.', path)  # fix sources with double dots
+        path = re.sub(r"['\"]", '.', path)  # fix sources with imbedded quotes
         return path
 
     def k_not_in_whitelist(self, k):
@@ -245,10 +247,22 @@ class carbon(object):
             self.carbon_max_metrics = 200
 
         try:
+            self.carbon_max_metrics = int(self.carbon_max_metrics)
+        except ValueError:
+            self.log.critical("carbon_max_metrics needs to be a integer")
+            sys.exit(1)
+
+        try:
             cfg['use_service_desc']
             self.use_service_desc = cfg['use_service_desc']
         except:
             self.use_service_desc = False
+
+        try:
+            cfg['metric_base_path']
+            self.metric_base_path = cfg['metric_base_path']
+        except:
+            self.metric_base_path = ''
 
         try:
             cfg['test_mode']
@@ -306,10 +320,11 @@ class carbon(object):
         """
         Builds a carbon metric
         """
+        pre = ""
+        if m.METRICBASEPATH != "":
+            pre = "%s." % m.METRICBASEPATH
         if m.GRAPHITEPREFIX != "":
-            pre = "%s." % m.GRAPHITEPREFIX
-        else:
-            pre = ""
+            pre += "%s." % m.GRAPHITEPREFIX
         if m.GRAPHITEPOSTFIX != "":
             post = ".%s" % m.GRAPHITEPOSTFIX
         else:
@@ -412,8 +427,9 @@ class statsd(object):
         # Converts the metric object list into a list of statsd tuples
         out_list = []
         for m in metrics:
-            path = '%s.%s.%s.%s' % (m.GRAPHITEPREFIX, m.HOSTNAME,
-                                    m.GRAPHITEPOSTFIX, m.LABEL)
+            path = '%s.%s.%s.%s.%s' % (m.METRICBASEPATH, m.GRAPHITEPREFIX,
+                                       m.HOSTNAME, m.GRAPHITEPOSTFIX,
+                                       m.LABEL)
             path = re.sub(r'\.$', '', path)  # fix paths that end in dot
             path = re.sub(r'\.\.', '.', path)  # fix paths with empty values
             mtype = self.set_type(m)  # gauge|counter|timer|set
@@ -452,6 +468,219 @@ class statsd(object):
 
 
 # ###########################################################
+# #### influxdb backend  ####################################
+
+class influxdb(object):
+    def __init__(self, cfg):
+        self.log = logging.getLogger("log.backends.influxdb")
+        self.log.info("InfluxDB backend initialized")
+        self.scheme = "http"
+        self.default_ports = {'https': 8087, 'http': 8086}
+        self.timeout = 5
+
+        if 'influxdb_use_ssl' in cfg:
+            if cfg['influxdb_use_ssl']:
+                self.scheme = "https"
+
+        if 'influxdb_servers' in cfg:
+            self.influxdb_servers = cfg['influxdb_servers'].split(',')
+        else:
+            self.influxdb_servers = ['127.0.0.1:%i' %
+                                     self.default_ports[self.scheme]]
+
+        if 'influxdb_user' in cfg:
+            self.influxdb_user = cfg['influxdb_user']
+        else:
+            self.log.critical("Missing influxdb_user in graphios.cfg")
+            sys.exit(1)
+
+        if 'influxdb_password' in cfg:
+            self.influxdb_password = cfg['influxdb_password']
+        else:
+            self.log.critical("Missing influxdb_password in graphios.cfg")
+            sys.exit(1)
+
+        if 'influxdb_db' in cfg:
+            self.influxdb_db = cfg['influxdb_db']
+        else:
+            self.influxdb_db = "nagios"
+
+        if 'influxdb_max_metrics' in cfg:
+            self.influxdb_max_metrics = cfg['influxdb_max_metrics']
+        else:
+            self.influxdb_max_metrics = 250
+
+        try:
+            self.influxdb_max_metrics = int(self.influxdb_max_metrics)
+        except ValueError:
+            self.log.critical("influxdb_max_metrics needs to be a integer")
+            sys.exit(1)
+
+    def build_url(self, server):
+        """ Returns a url to specified InfluxDB-server """
+        test_port = server.split(':')
+        if len(test_port) < 2:
+            server = "%s:%i" % (server, self.default_ports[self.scheme])
+
+        return "%s://%s/db/%s/series?u=%s&p=%s" % (self.scheme, server,
+                                                   self.influxdb_db,
+                                                   self.influxdb_user,
+                                                   self.influxdb_password)
+
+    def build_path(self, m):
+        """ Returns a path """
+        path = ""
+        if m.METRICBASEPATH != "":
+            path += "%s." % m.METRICBASEPATH
+
+        if m.GRAPHITEPREFIX != "":
+            path += "%s." % m.GRAPHITEPREFIX
+
+        path += "%s." % m.HOSTNAME
+
+        if m.SERVICEDESC != "":
+            path += "%s." % m.SERVICEDESC
+
+        path = "%s%s" % (path, m.LABEL)
+
+        if m.GRAPHITEPOSTFIX != "":
+            path = "%s.%s" % (path, m.GRAPHITEPOSTFIX)
+
+        return path
+
+    def chunks(self, l, n):
+        """ Yield successive n-sized chunks from l. """
+        for i in xrange(0, len(l), n):
+            yield l[i:i+n]
+
+    def _send(self, server, chunk):
+        self.log.debug("Connecting to InfluxDB at %s" % server)
+        json_body = json.dumps(chunk)
+        req = urllib2.Request(self.build_url(server), json_body)
+        req.add_header('Content-Type', 'application/json')
+
+        try:
+            r = urllib2.urlopen(req, timeout=self.timeout)
+            r.close()
+            return True
+        except urllib2.HTTPError as e:
+            body = e.read()
+            self.log.warning('Failed to send metrics to InfluxDB. \
+                                Status code: %d: %s' % (e.code, body))
+            return False
+        except IOError as e:
+            fail_string = "Failed to send metrics to InfluxDB. "
+            if hasattr(e, 'code'):
+                fail_string = fail_string + "Status code: %s" % e.code
+            if hasattr(e, 'reason'):
+                fail_string = fail_string + str(e.reason)
+            self.log.warning(fail_string)
+            return False
+
+    def send(self, metrics):
+        """ Connect to influxdb and send metrics """
+        ret = 0
+        perfdata = {}
+        series = []
+        for m in metrics:
+            ret += 1
+
+            path = self.build_path(m)
+
+            if path not in perfdata:
+                perfdata[path] = []
+
+            # influx assumes timestamp in milliseconds
+            timet_ms = int(m.TIMET)*1000
+
+            # Ensure a int/float gets passed
+            try:
+                value = int(m.VALUE)
+            except ValueError:
+                try:
+                    value = float(m.VALUE)
+                except ValueError:
+                    value = 0
+
+            perfdata[path].append([timet_ms, value])
+
+        for k, v in perfdata.iteritems():
+            series.append({"name": k, "columns": ["time", "value"],
+                           "points": v})
+
+        series_chunks = self.chunks(series, self.influxdb_max_metrics)
+        for chunk in series_chunks:
+            for s in self.influxdb_servers:
+                if not self._send(s, chunk):
+                    ret = 0
+
+        return ret
+
+
+# ###########################################################
+# #### influxdb-0.9 backend  ####################################
+
+class influxdb09(influxdb):
+    def __init__(self, cfg):
+        influxdb.__init__(self, cfg)
+        if 'influxdb_extra_tags' in cfg:
+            self.influxdb_extra_tags = ast.literal_eval(
+                cfg['influxdb_extra_tags'])
+            print self.influxdb_extra_tags
+        else:
+            self.influxdb_extra_tags = {}
+
+    def build_url(self, server):
+        """ Returns a url to specified InfluxDB-server """
+        test_port = server.split(':')
+        if len(test_port) < 2:
+            server = "%s:%i" % (server, self.default_ports[self.scheme])
+
+        return "%s://%s/write?u=%s&p=%s" % (self.scheme, server,
+                                            self.influxdb_user,
+                                            self.influxdb_password)
+
+    def send(self, metrics):
+        """ Connect to influxdb and send metrics """
+        ret = 0
+        perfdata = []
+        for m in metrics:
+            ret += 1
+
+            if (m.SERVICEDESC == ''):
+                path = m.HOSTCHECKCOMMAND
+            else:
+                path = m.SERVICEDESC
+
+            # Ensure a int/float gets passed
+            try:
+                value = int(m.VALUE)
+            except ValueError:
+                try:
+                    value = float(m.VALUE)
+                except ValueError:
+                    value = 0
+
+            tags = {"check": m.LABEL, "host": m.HOSTNAME}
+            tags.update(self.influxdb_extra_tags)
+
+            perfdata.append({
+                            "timestamp": int(m.TIMET),
+                            "measurement": path,
+                            "tags": tags,
+                            "fields": {"value": value}})
+
+        series_chunks = self.chunks(perfdata, self.influxdb_max_metrics)
+        for chunk in series_chunks:
+            series = {"database": self.influxdb_db, "points": chunk}
+            for s in self.influxdb_servers:
+                if not self._send(s, series):
+                    ret = 0
+
+        return ret
+
+
+# ###########################################################
 # #### stdout backend  #######################################
 
 class stdout(object):
@@ -478,6 +707,7 @@ class stdout(object):
             print("%s:%s" % ('HOSTSTATETYPE ', metric.HOSTSTATETYPE))
             print("%s:%s" % ('SERVICESTATE ', metric.SERVICESTATE))
             print("%s:%s" % ('SERVICESTATETYPE ', metric.SERVICESTATETYPE))
+            print("%s:%s" % ('METRICBASEPATH ', metric.METRICBASEPATH))
             print("%s:%s" % ('GRAPHITEPREFIX ', metric.GRAPHITEPREFIX))
             print("%s:%s" % ('GRAPHITEPOSTFIX ', metric.GRAPHITEPOSTFIX))
             print("-------")

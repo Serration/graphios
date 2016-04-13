@@ -11,6 +11,7 @@
 # Steffen Zieger <me@saz.sh>
 # Nathan Bird <ecthellion@gmail.com>
 # Dave Josephsen <dave@skeptech.org>
+# Emil Thelin <https://github.com/gummiboll>
 #
 # This program is free software; you can redistribute it and/or
 # modify it under the terms of the GNU General Public License
@@ -55,7 +56,7 @@ spool_directory = '/var/spool/nagios/graphios'
 
 # graphios log info
 log_file = ''
-log_max_size = 25165824         # 24 MB
+log_max_size = 24
 
 # by default we will check the current path for graphios.cfg, if config_file
 # is passed as a command line argument we will use that instead.
@@ -125,9 +126,13 @@ class GraphiosMetric(object):
         self.HOSTSTATETYPE = ''         # HARD|SOFT
         self.SERVICESTATE = ''          # current state afa nagios is concerned
         self.SERVICESTATETYPE = ''      # HARD|SOFT
+        self.METRICBASEPATH = ''        # Establishes a root base path
         self.GRAPHITEPREFIX = ''        # graphios prefix
         self.GRAPHITEPOSTFIX = ''       # graphios suffix
         self.VALID = False              # if this metric is valid
+
+        if 'metric_base_path' in cfg:
+            self.METRICBASEPATH = cfg['metric_base_path']
 
     def validate(self):
         # because we eliminated all whitespace, there shouldn't be any quotes
@@ -148,6 +153,9 @@ class GraphiosMetric(object):
             else:
                 # not using service descriptions
                 if (
+                    # We should keep this logic and not check for a
+                    # base path here. Just because there's a base path
+                    # doesn't mean the metric should be considered valid
                     self.GRAPHITEPREFIX == "" and
                     self.GRAPHITEPOSTFIX == ""
                 ):
@@ -250,7 +258,7 @@ def verify_options(opts):
         cfg["log_file"] = opts.log_file
     if cfg["log_file"] == "''" or cfg["log_file"] == "":
         cfg["log_file"] = "%s/graphios.log" % sys.path[0]
-    cfg["log_max_size"] = 25165824         # 24 MB
+    cfg["log_max_size"] = 24
     if opts.verbose:
         cfg["debug"] = True
         cfg["log_level"] = "logging.DEBUG"
@@ -296,8 +304,21 @@ def configure():
     sets up graphios config
     """
     global debug
+    try:
+        cfg["log_max_size"] = int(cfg["log_max_size"])
+    except ValueError:
+        print "log_max_size needs to be a integer"
+        sys.exit(1)
+
+    # Convert cfg["log_max_size"] to bytes. Assume its already in bytes
+    # if its > 1000000
+    if cfg["log_max_size"] < 1000000:
+        log_max_bytes = cfg["log_max_size"]*1024*1024
+    else:
+        log_max_bytes = cfg["log_max_size"]
+
     log_handler = logging.handlers.RotatingFileHandler(
-        cfg["log_file"], maxBytes=cfg["log_max_size"], backupCount=4,
+        cfg["log_file"], maxBytes=log_max_bytes, backupCount=4,
         # encoding='bz2')
     )
     formatter = logging.Formatter(
@@ -484,6 +505,8 @@ def init_backends():
     avail_backends = ("carbon",
                       "statsd",
                       "librato",
+                      "influxdb",
+                      "influxdb09",
                       "stdout",
                       )
     # populate the controller dict from avail + config. this assumes you named
