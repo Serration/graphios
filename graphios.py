@@ -369,6 +369,7 @@ def process_log(file_name):
                 continue
             for metric in metric_array:
                 try:
+                    metric = re.sub(r"\s", cfg["replacement_character"], metric)
                     nobj = copy.copy(mobj)
                     (nobj.LABEL, d) = metric.split('=')
                     v = d.split(';')[0]
@@ -397,13 +398,13 @@ def get_mobj(nag_array):
             log.warn("could not split value %s, dropping metric" % var)
             return False
 
-        value = re.sub("/", cfg["replacement_character"], value)
+        value = re.sub(r"[/\.\|\\\,\{\}\[\]]", cfg["replacement_character"], value)
         if re.search("PERFDATA", var_name):
             mobj.PERFDATA = value
         elif re.search("^\$_", value):
             continue
         else:
-            value = re.sub("\s", "", value)
+            value = re.sub("\s", cfg["replacement_character"], value)
             setattr(mobj, var_name, value)
     mobj.validate()
     if mobj.VALID is True:
